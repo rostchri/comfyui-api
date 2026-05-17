@@ -89,6 +89,19 @@ class SubmissionQueue {
 export const submissionQueue = new SubmissionQueue();
 
 /**
+ * Counters for observability. Incremented by the /prompt handler; read by
+ * the /stats and /metrics endpoints. Plain numbers — wrapper is
+ * single-process, no atomics needed.
+ */
+export const counters = {
+  prompts_submitted_total: 0,
+  prompts_completed_total: 0,
+  prompts_failed_total: 0,
+  idempotency_hits_total: 0,
+  startup_time_ms: Date.now(),
+};
+
+/**
  * Idempotency map: request.body.id → in-flight Promise of the final response
  * payload. Retries (same id) bypass the queue and await the original promise.
  * Entries are GC-ed 60 s after settlement so genuine reuse of an id later
@@ -98,6 +111,11 @@ const inflight = new Map<string, Promise<any>>();
 
 export function getInflight(id: string): Promise<any> | undefined {
   return inflight.get(id);
+}
+
+/** Snapshot of in-flight map size (for metrics). */
+export function getInflightCount(): number {
+  return inflight.size;
 }
 
 /**
@@ -122,6 +140,11 @@ export function setPromptMeta(
 
 export function getPromptMeta(apiId: string): Record<string, string> | undefined {
   return promptMetaStore.get(apiId);
+}
+
+/** Snapshot of promptMeta map size (for metrics). */
+export function getPromptMetaCount(): number {
+  return promptMetaStore.size;
 }
 
 export function setInflight<T>(id: string, p: Promise<T>): void {
