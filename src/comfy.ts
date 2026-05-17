@@ -184,6 +184,30 @@ async function collectExecutionStats(
     const stats: ExecutionStats = {
       comfy_execution: { start, end: 0, duration: 0, nodes: {} },
     };
+
+    // FORK PATCH (rostchri): Fail fast if the WS is not connected when we
+    // start listening — without this guard, addEventListener on a null
+    // client would silently never fire and the promise would hang forever.
+    // (This is what happened in production: ComfyUI crashed, launch.sh
+    // restarted it, but the wrapper's wsClient stayed null and every new
+    // /prompt blocked the submissionQueue mutex.)
+    if (!wsClient || wsClient.readyState !== WebSocket.OPEN) {
+      return reject(
+        new Error(
+          `Cannot wait for prompt ${promptId}: ComfyUI websocket is not connected (readyState=${wsClient?.readyState})`
+        )
+      );
+    }
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      clearTimeout(stallTimer);
+      wsClient?.removeEventListener("close", onClose);
+      wsClient?.removeEventListener("message", handleMessage);
+    };
+
     const handleMessage = (event: MessageEvent) => {
       const { data } = event;
       if (typeof data === "string") {
@@ -203,29 +227,40 @@ async function collectExecutionStats(
           stats.comfy_execution.end = Date.now();
           stats.comfy_execution.duration =
             stats.comfy_execution.end - stats.comfy_execution.start;
-          wsClient?.removeEventListener("close", onClose);
-          wsClient?.removeEventListener("message", handleMessage);
+          cleanup();
           log.info(`Prompt ${promptId} completed execution`);
           return resolve(stats);
         } else if (isExecutionErrorMessage(message)) {
-          wsClient?.removeEventListener("close", onClose);
-          wsClient?.removeEventListener("message", handleMessage);
+          cleanup();
           return reject(new Error("Prompt execution failed"));
         } else if (isExecutionInterruptedMessage(message)) {
-          wsClient?.removeEventListener("close", onClose);
-          wsClient?.removeEventListener("message", handleMessage);
+          cleanup();
           return reject(new Error("Prompt execution interrupted"));
         }
       }
     };
 
     const onClose = () => {
-      wsClient?.removeEventListener("message", handleMessage);
-      wsClient?.removeEventListener("close", onClose);
+      cleanup();
       return reject(new Error("Websocket closed"));
     };
-    wsClient?.addEventListener("message", handleMessage);
-    wsClient?.addEventListener("close", onClose);
+
+    // FORK PATCH (rostchri): Stall-timeout fallback. If ComfyUI dies mid-
+    // render without sending an error event (e.g. CUDA OOM, segfault), the
+    // promise would otherwise hang forever. After 15 minutes without a
+    // terminal event we give up so the submissionQueue can drain.
+    const STALL_TIMEOUT_MS = Number(process.env.COMFY_STALL_TIMEOUT_MS ?? 15 * 60 * 1000);
+    const stallTimer = setTimeout(() => {
+      cleanup();
+      reject(
+        new Error(
+          `Prompt ${promptId} stalled: no execution_success event after ${STALL_TIMEOUT_MS} ms`
+        )
+      );
+    }, STALL_TIMEOUT_MS);
+
+    wsClient.addEventListener("message", handleMessage);
+    wsClient.addEventListener("close", onClose);
   });
 }
 
@@ -398,12 +433,40 @@ export async function runPromptAndGetOutputs(
 
 let wsClient: WebSocket | null = null;
 
+// FORK PATCH (rostchri): module-scoped state for WS auto-reconnect.
+// When ComfyUI crashes and its launch.sh watchdog restarts the Python
+// process, the wrapper's WS connection drops. Without auto-reconnect the
+// wrapper accepts new /prompt submissions but they hang forever because
+// collectExecutionStats waits for events on a dead socket.
+let wsHooks: WebhookHandlers | null = null;
+let wsLog: FastifyBaseLogger | null = null;
+let wsUseApiIDs: boolean = true;
+let wsShutdown: boolean = false;
+let wsReconnectBackoffMs: number = 1000;
+const WS_RECONNECT_BACKOFF_MAX_MS = 30_000;
+
+/** Stop the auto-reconnect loop (e.g. during SIGINT shutdown). */
+export function stopComfyUIWebsocketReconnect(): void {
+  wsShutdown = true;
+}
+
 export function connectToComfyUIWebsocketStream(
   hooks: WebhookHandlers,
   log: FastifyBaseLogger,
   useApiIDs: boolean = true
 ): Promise<WebSocket> {
+  wsHooks = hooks;
+  wsLog = log;
+  wsUseApiIDs = useApiIDs;
+  wsShutdown = false;
+  return openComfyUIWebsocket();
+}
+
+function openComfyUIWebsocket(): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
+    const hooks = wsHooks!;
+    const log = wsLog!;
+    const useApiIDs = wsUseApiIDs;
     wsClient = new WebSocket(config.comfyWSURL);
     wsClient.on("message", (data, isBinary) => {
       if (hooks.onMessage) {
@@ -463,6 +526,7 @@ export function connectToComfyUIWebsocketStream(
 
     wsClient.on("open", () => {
       log.info("Connected to Comfy UI websocket");
+      wsReconnectBackoffMs = 1000; // reset backoff on successful connect
 
       return resolve(wsClient as WebSocket);
     });
@@ -473,6 +537,23 @@ export function connectToComfyUIWebsocketStream(
 
     wsClient.on("close", () => {
       log.info("Disconnected from Comfy UI websocket");
+      // FORK PATCH (rostchri): Auto-reconnect. ComfyUI's launch.sh
+      // watchdog restarts the Python process on crash; we need to
+      // re-establish our WS so collectExecutionStats has something
+      // to listen on.
+      if (wsShutdown) return;
+      const delay = wsReconnectBackoffMs;
+      wsReconnectBackoffMs = Math.min(
+        wsReconnectBackoffMs * 2,
+        WS_RECONNECT_BACKOFF_MAX_MS
+      );
+      log.info(`Reconnecting to ComfyUI websocket in ${delay} ms`);
+      setTimeout(() => {
+        if (wsShutdown) return;
+        openComfyUIWebsocket().catch((e: any) => {
+          log.error(`WS reconnect attempt failed: ${e?.message ?? e}`);
+        });
+      }, delay).unref?.();
     });
   });
 }
