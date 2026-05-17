@@ -450,6 +450,27 @@ export function stopComfyUIWebsocketReconnect(): void {
   wsShutdown = true;
 }
 
+/** Read-only snapshot of WS connection state (for /stats and /metrics). */
+export function getWsState(): {
+  readyState: number;
+  readyStateLabel: string;
+  reconnectBackoffMs: number;
+  shutdown: boolean;
+} {
+  const rs = wsClient?.readyState ?? 3 /* CLOSED */;
+  const label =
+    rs === WebSocket.CONNECTING ? "connecting" :
+    rs === WebSocket.OPEN ? "open" :
+    rs === WebSocket.CLOSING ? "closing" :
+    "closed";
+  return {
+    readyState: rs,
+    readyStateLabel: label,
+    reconnectBackoffMs: wsReconnectBackoffMs,
+    shutdown: wsShutdown,
+  };
+}
+
 export function connectToComfyUIWebsocketStream(
   hooks: WebhookHandlers,
   log: FastifyBaseLogger,
