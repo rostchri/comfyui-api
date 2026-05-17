@@ -321,9 +321,14 @@ server.after(() => {
           }
           filenames.push(filename);
           buffers.push(fileBuffer);
-          unlinks.push(
-            fsPromises.unlink(path.join(config.outputDir, originalFilename))
-          );
+          // FORK PATCH (rostchri): skip unlink so files stay on disk when
+          // KEEP_OUTPUT_FILES=true. Lets downstream proxies serve via /view
+          // without round-tripping base64 through the wire.
+          if (process.env.KEEP_OUTPUT_FILES !== 'true') {
+            unlinks.push(
+              fsPromises.unlink(path.join(config.outputDir, originalFilename))
+            );
+          }
         }
         await Promise.all(unlinks);
         stats.postprocess_time =
@@ -469,7 +474,14 @@ server.after(() => {
       } else {
         uploadPromise = runPromptPromise.then(
           async ({ buffers, filenames, stats }) => {
-            const images: string[] = buffers.map((b) => b.toString("base64"));
+            // FORK PATCH (rostchri): skip base64-encoding when
+            // RETURN_BASE64=false. Consumers use `filenames[]` to build URLs
+            // pointing at ComfyUI's /view endpoint instead. Cuts response
+            // size by 99.7% for image workflows.
+            const skipBase64 = process.env.RETURN_BASE64 === 'false';
+            const images: string[] = skipBase64
+              ? []
+              : buffers.map((b) => b.toString("base64"));
             return { images, filenames, stats };
           }
         );
