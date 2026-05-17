@@ -231,6 +231,45 @@ server.after(() => {
     }
   );
 
+  // FORK PATCH (rostchri): Aggregate `<name>.meta.json` sidecar files into
+  // a single workflows-meta endpoint. Same shape as the comfyui-api-proxy
+  // custom-node on :8188 — moving it here lets consumers stay on the
+  // single wrapper port.
+  //
+  // Each sidecar is freeform JSON; common fields used by clients:
+  //   { display_name, description, category, output_format,
+  //     requires_image_input, estimated_seconds_p50, tags,
+  //     param_visibility: { primary: [...], advanced: [...] } }
+  app.get(
+    "/workflows-meta",
+    async (request, reply) => {
+      const out: Record<string, any> = {};
+      try {
+        const entries = await fsPromises.readdir(config.workflowDir);
+        for (const entry of entries.sort()) {
+          if (!entry.endsWith(".meta.json")) continue;
+          const name = entry.slice(0, -".meta.json".length);
+          try {
+            const txt = await fsPromises.readFile(
+              path.join(config.workflowDir, entry),
+              "utf8"
+            );
+            out[name] = JSON.parse(txt);
+          } catch (e: any) {
+            app.log.warn(
+              { entry, err: e.message },
+              "failed to read workflow meta"
+            );
+            out[name] = { error: e.message };
+          }
+        }
+      } catch (e: any) {
+        app.log.error({ err: e.message }, "workflows-meta readdir failed");
+      }
+      return reply.send({ workflows: out, workflow_dir: config.workflowDir });
+    }
+  );
+
   // FORK PATCH (rostchri): Serve the rendered image directly from the
   // wrapper port. Lets downstream consumers stick to ONE base URL — the
   // wrapper at :3000 — instead of also needing access to ComfyUI's :8188
