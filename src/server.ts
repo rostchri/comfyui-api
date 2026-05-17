@@ -231,6 +231,52 @@ server.after(() => {
     }
   );
 
+  // FORK PATCH (rostchri): Serve the rendered image directly from the
+  // wrapper port. Lets downstream consumers stick to ONE base URL — the
+  // wrapper at :3000 — instead of also needing access to ComfyUI's :8188
+  // /view endpoint. Requires KEEP_OUTPUT_FILES=true (otherwise the file
+  // was already unlink-ed during postprocess).
+  //
+  // Path traversal is guarded: filename must not contain '/' or '..'.
+  app.get<{ Params: { filename: string } }>(
+    "/image/:filename",
+    async (request, reply) => {
+      const { filename } = request.params;
+      if (
+        !filename ||
+        filename.includes("/") ||
+        filename.includes("..") ||
+        filename.includes("\\") ||
+        filename.length > 256
+      ) {
+        return reply.code(400).send({ error: "invalid filename" });
+      }
+      const filePath = path.join(config.outputDir, filename);
+      try {
+        const buf = await fsPromises.readFile(filePath);
+        const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+        const mime =
+          ext === "png" ? "image/png" :
+          ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+          ext === "webp" ? "image/webp" :
+          ext === "gif" ? "image/gif" :
+          ext === "mp4" ? "video/mp4" :
+          ext === "webm" ? "video/webm" :
+          "application/octet-stream";
+        reply.header("Content-Type", mime);
+        // Filename is UUID-prefixed by the workflow → safe to cache forever.
+        reply.header("Cache-Control", "public, max-age=31536000, immutable");
+        return reply.send(buf);
+      } catch (e: any) {
+        if (e?.code === "ENOENT") {
+          return reply.code(404).send({ error: "not found", filename });
+        }
+        app.log.error({ filename, err: e.message }, "image read failed");
+        return reply.code(500).send({ error: e.message });
+      }
+    }
+  );
+
   /**
    * This route is the primary wrapper around the ComfyUI /prompt endpoint.
    * It shares the same schema as the ComfyUI /prompt endpoint, but adds the
