@@ -47,6 +47,16 @@ import { z } from "zod";
 import { WebSocket } from "ws";
 import { fetch } from "undici";
 import { getProxyDispatcher } from "./proxy-dispatcher";
+// FORK PATCH (rostchri): serial submission queue, idempotency dedup,
+// SSE progress stream. See src/job-bus.ts / src/sse-progress.ts.
+import {
+  submissionQueue,
+  getInflight,
+  setInflight,
+  relayWsMessage,
+  setPromptMeta,
+} from "./job-bus";
+import { registerProgressRoute } from "./sse-progress";
 
 const { apiVersion: version } = config;
 
@@ -249,6 +259,34 @@ server.after(() => {
     async (request, reply) => {
       let { prompt, id, webhook, webhook_v2, convert_output, credentials } = request.body;
 
+      // FORK PATCH (rostchri): Idempotency-Key dedup. Retries with the same
+      // request id (or Idempotency-Key header) attach to the existing
+      // in-flight promise instead of submitting a duplicate ComfyUI job.
+      const idemKeyHeader = (request.headers["idempotency-key"] ||
+        request.headers["x-idempotency-key"]) as string | undefined;
+      if (idemKeyHeader && !id) {
+        id = idemKeyHeader;
+      }
+      if (id) {
+        const existing = getInflight(id);
+        if (existing) {
+          app.log.info(
+            { id },
+            "Idempotency hit: returning result of in-flight prompt"
+          );
+          try {
+            const result = await existing;
+            return reply.send(result);
+          } catch (e: any) {
+            return reply.code(500).send({
+              error: `In-flight prompt failed: ${e.message}`,
+              location: "prompt",
+              id,
+            });
+          }
+        }
+      }
+
       /**
        * Here we go through all the nodes in the prompt to validate it,
        * and also to do some pre-processing.
@@ -340,7 +378,37 @@ server.after(() => {
         };
       };
 
-      const runPromptPromise = runPromptAndGetOutputs(id, prompt, log)
+      // FORK PATCH (rostchri): publish a node-id → display title map BEFORE
+      // submitting to ComfyUI, so SSE clients (which open /progress/<id> in
+      // parallel) can render "KSampler" instead of "node 6". Title comes from
+      // the workflow author's `_meta.title`; fall back to `class_type`.
+      if (id) {
+        const titles: Record<string, string> = {};
+        for (const [nid, node] of Object.entries(
+          prompt as Record<string, any>
+        )) {
+          if (node && typeof node === "object") {
+            const meta = (node as any)._meta;
+            titles[nid] =
+              (meta && typeof meta.title === "string" && meta.title) ||
+              (node as any).class_type ||
+              nid;
+          }
+        }
+        setPromptMeta(id, titles);
+      }
+
+      // FORK PATCH (rostchri): submit through the serial queue so ComfyUI
+      // only ever sees one in-flight job. Clients still wait on this same
+      // promise; HTTP-side timeouts unchanged.
+      const queueDepthAtSubmit = submissionQueue.depth;
+      if (queueDepthAtSubmit > 0) {
+        log.info(
+          `Queued behind ${queueDepthAtSubmit} pending submission(s); will run when free`
+        );
+      }
+      const runPromptPromise = submissionQueue
+        .run(() => runPromptAndGetOutputs(id, prompt, log))
         .catch((e: any) => {
           log.error(`Failed to run prompt: ${e.message}`);
           if (webhook_v2) {
@@ -500,6 +568,23 @@ server.after(() => {
           return { images, stats, filenames };
         }
       );
+
+      // FORK PATCH (rostchri): register the final payload promise under the
+      // request id so idempotency retries collapse onto this same render.
+      // Shape matches what reply.send below returns.
+      const inflightPromise = finalStatsPromise.then(
+        ({ images, stats, filenames }) => ({
+          ...request.body,
+          id,
+          prompt,
+          images,
+          filenames,
+          stats,
+        })
+      );
+      if (id) {
+        setInflight(id, inflightPromise);
+      }
 
       if (asyncUpload) {
         reply.code(202).send({ ...request.body, status: "ok", id, prompt });
@@ -802,6 +887,12 @@ server.after(() => {
     }
   };
   walk(workflows);
+
+  // FORK PATCH (rostchri): SSE endpoint that streams progress events for a
+  // specific prompt id. Clients open EventSource('/progress/<id>') in
+  // parallel with POST /prompt or /workflow/:name and read 'progress',
+  // 'executing', 'executed', 'execution_success' events.
+  registerProgressRoute(app);
 });
 
 let comfyWebsocketClient: WebSocket | null = null;
@@ -855,6 +946,31 @@ async function launchComfyUIAndAPIServerAndWaitForWarmup() {
       setDeletionCost(queueDepth);
     };
   }
+  // FORK PATCH (rostchri): tee every progress-relevant ComfyUI WS message
+  // onto the in-process progressBus so the SSE /progress/:apiId route can
+  // fan out events. relayWsMessage internally filters & emits structured
+  // events keyed by apiId (already mapped from comfyId by the wrapper).
+  const wrapHook = (name: keyof typeof handlers): void => {
+    const orig = (handlers as any)[name];
+    (handlers as any)[name] = (msg: any) => {
+      try {
+        relayWsMessage(msg);
+      } catch (e: any) {
+        server.log.debug(`progressBus relay failed: ${e.message}`);
+      }
+      if (typeof orig === "function") {
+        orig(msg);
+      }
+    };
+  };
+  wrapHook("onStatus");
+  wrapHook("onProgress");
+  wrapHook("onExecuting");
+  wrapHook("onExecutionStart");
+  wrapHook("onExecuted");
+  wrapHook("onExecutionSuccess");
+  wrapHook("onExecutionError");
+  wrapHook("onExecutionInterrupted");
   comfyWebsocketClient = await connectToComfyUIWebsocketStream(
     handlers,
     server.log,
